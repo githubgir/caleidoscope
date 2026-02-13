@@ -1,0 +1,69 @@
+db_path: "data/caleidoscope.db"
+digest_dir: "digests"
+rate_limit_seconds: 2.0
+
+sources:
+  - name: msci
+    entity: MSCI
+    enabled: true
+    category_default: news
+    urls:
+      - https://www.msci.com/rss/msci-index-announcements.xml
+
+  - name: sp_dji
+    entity: S&P DJI
+    enabled: true
+    category_default: news
+    urls:
+      - https://www.spglobal.com/spdji/en/rss/rss-details/?rssFeedName=press-releases
+
+  - name: stoxx
+    entity: STOXX
+    enabled: true
+    category_default: news
+    urls:
+      - https://www.stoxx.com/document/News/Feeds/StoxxRss
+
+  - name: blackrock
+    entity: BlackRock
+    enabled: true
+    category_default: news
+    urls:
+      - https://www.blackrock.com/corporate/newsroom/rss/press-releases.xml
+
+  - name: edgar
+    entity: null
+    enabled: true
+    category_default: regulatory
+    urls:
+      - https://efts.sec.gov/LATEST/search-index
+
+  - name: google_news
+    entity: null
+    enabled: true
+    category_default: news
+    urls:
+      - https://news.google.com/rss/search?q=MSCI+index
+      - https://news.google.com/rss/search?q=S%26P+index+launch
+      - https://news.google.com/rss/search?q=FTSE+Russell
+      - https://news.google.com/rss/search?q=ETF+launch
+      - https://news.google.com/rss/search?q=ESG+index
+      - https://news.google.com/rss/search?q=index+methodology
+
+  - name: market_news
+    entity: null
+    enabled: true
+    category_default: market_commentary
+    urls:
+      - https://www.reuters.com/finance/rss
+      - https://finance.yahoo.com/news/rss
+      - https://www.morningstar.com/rss/articles.xml
+
+  - name: etf_news
+    entity: null
+    enabled: true
+    category_default: news
+    urls:
+      - https://www.etfstream.com/feed
+      - https://www.etf.com/feeds/rss
+      - https://www.etftrends.com/feed/

@@ -1,631 +1,455 @@
-# Implementation Plan — Caleidoscope Market Intelligence Aggregator
+# Implementation Plan — Caleidoscope
 
-## Overview
+## Parallel Workstream Split
 
-This plan covers the Phase 1 MVP: **free sources only, SQLite, no credentials required**. Each step produces a working, testable increment. LLM summarisation is optional (works if you set `ANTHROPIC_API_KEY`, gracefully skipped otherwise).
-
----
-
-## Step 0: Project Scaffolding
-
-**What**: Set up the Python project structure, dependencies, and configuration.
-
-**Actions**:
-1. Create project layout:
-   ```
-   caleidoscope/
-   ├── pyproject.toml              # Project metadata, dependencies
-   ├── config.yaml                 # Source definitions, schedule config
-   ├── .env.example                # Template for optional env vars
-   ├── src/
-   │   └── caleidoscope/
-   │       ├── __init__.py
-   │       ├── __main__.py         # CLI entry point
-   │       ├── config.py           # Load YAML + env vars
-   │       ├── db/
-   │       │   ├── __init__.py
-   │       │   ├── models.py       # SQLAlchemy models (SQLite)
-   │       │   └── session.py      # DB session/engine factory
-   │       ├── collectors/
-   │       │   ├── __init__.py
-   │       │   ├── base.py         # Abstract collector class
-   │       │   ├── rss.py          # Generic RSS collector
-   │       │   ├── msci.py
-   │       │   ├── sp_dji.py
-   │       │   ├── stoxx.py
-   │       │   ├── blackrock.py
-   │       │   ├── edgar.py
-   │       │   └── google_news.py
-   │       ├── processing/
-   │       │   ├── __init__.py
-   │       │   ├── normaliser.py   # Clean, normalise, deduplicate
-   │       │   └── tagger.py       # Auto-categorise and tag
-   │       ├── search/
-   │       │   ├── __init__.py
-   │       │   └── engine.py       # FTS5 search queries
-   │       ├── digest/
-   │       │   ├── __init__.py
-   │       │   ├── generator.py    # Compile digest from DB
-   │       │   ├── summariser.py   # LLM summarisation (optional)
-   │       │   └── renderer.py     # Markdown templates
-   │       └── cli.py              # Typer CLI commands
-   └── tests/
-       ├── conftest.py
-       ├── test_collectors/
-       ├── test_processing/
-       ├── test_search/
-       └── test_digest/
-   ```
-
-2. Dependencies in `pyproject.toml`:
-   - Core: `httpx`, `beautifulsoup4`, `feedparser`, `sqlalchemy`, `pyyaml`, `pydantic`, `typer[all]`
-   - Optional: `anthropic` (for LLM summaries — not required)
-   - Dev: `pytest`, `ruff`
-   - No Playwright initially (add only if a specific site needs JS rendering)
-
-3. Create `.env.example`:
-   ```
-   # All optional for Phase 1
-   ANTHROPIC_API_KEY=         # Optional: enables AI summaries in digest
-   CALEIDOSCOPE_DB=data/caleidoscope.db  # Default DB location
-   ```
-
-4. Create `config.yaml` with source definitions and category keywords.
-
-**Deliverable**: `pip install -e .` installs the package; `caleidoscope --help` shows CLI; no external services needed.
-
----
-
-## Step 1: Database Setup (SQLite + FTS5)
-
-**What**: Create the SQLite database with FTS5 full-text search.
-
-**Actions**:
-1. `db/models.py` — SQLAlchemy models:
-   - `Item` model: id (UUID text), url, url_hash, title, published_at, collected_at, source, entity, category, body, summary, tags (JSON text), raw_html_path
-   - `DigestLog` model: id, generated_at, item_count, digest_md
-
-2. `db/session.py`:
-   - `get_engine()` — creates SQLite engine pointing to `data/caleidoscope.db`
-   - `init_db()` — creates tables + FTS5 virtual table + triggers (see PRD Section 10)
-   - `get_session()` — returns a session
-
-3. CLI command: `caleidoscope init-db` — creates the database file and schema.
-
-4. Test: init-db creates file; can insert and query an item; FTS5 search works.
-
-**Deliverable**: `caleidoscope init-db` creates a working SQLite database with full-text search.
-
----
-
-## Step 2: Base Collector Framework
-
-**What**: Build the abstract collector class and normalisation/dedup pipeline.
-
-**Actions**:
-1. `collectors/base.py` — abstract base class:
-   ```python
-   class BaseCollector(ABC):
-       name: str
-       entity: str | None
-
-       @abstractmethod
-       async def collect(self) -> list[RawItem]: ...
-
-       async def run(self, session) -> CollectorResult:
-           """Collect, normalise, deduplicate, store."""
-   ```
-   - `RawItem`: pydantic model with `title, url, date, source, entity, body, category`
-   - Built-in retry logic (3 attempts, exponential backoff)
-   - Respects rate limiting (configurable delay between requests, default 2s per domain)
-   - Logs stats: items found, new items stored, duplicates skipped, errors
-
-2. `collectors/rss.py` — generic RSS collector (reusable for any RSS feed):
-   - Takes feed URL + entity/source config
-   - Parses with `feedparser`
-   - Returns list of `RawItem`s
-
-3. `processing/normaliser.py`:
-   - Strip HTML tags from body text
-   - Normalise whitespace, encoding
-   - Generate URL hash (SHA-256) for dedup
-   - Check DB for existing hash before insert
-
-4. `processing/tagger.py`:
-   - Keyword-based category detection (configurable keyword-to-category mapping in `config.yaml`)
-   - Entity detection via keyword lists (e.g., body mentions "MSCI" → entity tag)
-
-5. Tests with mock HTTP responses (no real network calls in tests).
-
-**Deliverable**: Can run a collector against a mock source, see items appear in SQLite with correct tags.
-
----
-
-## Step 3: Competitor Collectors (MSCI, S&P DJI, STOXX)
-
-**What**: Implement collectors for the three main competitors. All free, no auth.
-
-**Actions**:
-1. **MSCI collector** (`collectors/msci.py`):
-   - Parse MSCI press releases / media RSS feed
-   - Scrape `msci.com` announcements page for index-related news
-   - Scrape research/insights listing for new papers
-   - Category mapping: announcement → `index_launch` / `methodology_change`; paper → `research`
-
-2. **S&P DJI collector** (`collectors/sp_dji.py`):
-   - Parse `spglobal.com/spdji` press release RSS
-   - Scrape press room listing for index launches and methodology updates
-   - Monitor consultation/commentary pages
-
-3. **STOXX collector** (`collectors/stoxx.py`):
-   - Scrape `stoxx.com` announcements / media list
-   - Parse any available RSS feeds
-   - Monitor for rulebook updates
-
-4. For each: save an HTML fixture from the real site; write a test that parses the fixture.
-
-**Deliverable**: `caleidoscope collect --source msci,sp_dji,stoxx` populates DB with real items.
-
----
-
-## Step 4: Client Collector — BlackRock/iShares + News
-
-**What**: Monitor BlackRock (largest ETF issuer) and add news sources.
-
-**Actions**:
-1. **BlackRock collector** (`collectors/blackrock.py`):
-   - Scrape iShares press releases / product announcements
-   - Parse RSS for blog posts and insights
-   - Categories: `etf_launch`, `etf_closure`, `fee_change`, `research`
-
-2. **Google News collector** (`collectors/google_news.py`):
-   - Configure Google News RSS URLs with relevant query terms:
-     - "index launch ETF", "MSCI index", "S&P index", "FTSE Russell",
-       "ETF launch", "passive investing", "ESG index", etc.
-   - Instance of generic RSS collector with custom URL builder
-   - Category: `news`
-
-3. **ETF Stream / ETF.com RSS** (instance of generic RSS collector):
-   - Configure feed URLs
-   - Category: `news` / `etf_launch`
-
-4. **Market commentary collectors** (instances of generic RSS collector):
-   - Reuters RSS — market/finance section
-   - Yahoo Finance RSS — market commentary, ETF coverage
-   - Morningstar RSS — fund/ETF analysis
-   - Category: `market_commentary`
-   - These provide broader market context beyond competitor/client intel
-
-5. Tests with fixtures.
-
-**Deliverable**: `caleidoscope collect --all` populates DB from competitors, BlackRock, and news.
-
----
-
-## Step 5: SEC EDGAR Collector
-
-**What**: Monitor SEC filings for ETF registrations and index-related rule changes.
-
-**Actions**:
-1. **EDGAR collector** (`collectors/edgar.py`):
-   - Use EDGAR FULL-TEXT search API (`efts.sec.gov/LATEST/search-index`)
-   - Search for recent filings matching:
-     - Form types: N-1A (ETF registration), 19b-4 (exchange rule filings for new indices)
-     - Keywords: "index", "ETF", entity names
-   - Extract: filing title, form type, filer name, date, URL to filing
-   - Category: `regulatory`
-   - Rate limit: SEC asks for max 10 requests/second (we'll do 1/2s to be safe)
-   - Set `User-Agent` header to identify the application (SEC requirement)
-
-2. Test with saved API response fixture.
-
-**Deliverable**: SEC filings for ETF/index activity flowing into DB.
-
----
-
-## Step 6: Search Engine (CLI)
-
-**What**: Implement full-text search via FTS5.
-
-**Actions**:
-1. `search/engine.py`:
-   - Build FTS5 `MATCH` queries from user input
-   - Support filters: `source`, `entity`, `category`, `date_from`, `date_to`
-   - Return results ranked by FTS5 rank, with date as tiebreaker
-   - Snippet extraction using `snippet()` FTS5 function
-   - Pagination (default 20 results)
-
-2. `cli.py` — add search command:
-   ```
-   caleidoscope search "MSCI ESG" --since 7d --entity MSCI --category research
-   caleidoscope search "fee change" --source blackrock --since 30d
-   caleidoscope search "19b-4" --source edgar
-   ```
-   - Pretty-print results: title, source, entity, date, snippet, URL
-
-3. Tests against seeded SQLite DB.
-
-**Deliverable**: Full-text search of the entire archive from the command line.
-
----
-
-## Step 7: Digest Generator (Daily, Weekly, Monthly)
-
-**What**: Build the briefing pipeline with three cadences.
-
-**Actions**:
-1. `digest/generator.py`:
-   - Three modes: `daily` (last 24h), `weekly` (last 7 days), `monthly` (last calendar month)
-   - Query items for the relevant time window
-   - Group into sections:
-     1. **Market commentary** — broader market news, macro context, industry trends
-     2. Index launches & methodology changes
-     3. ETF product actions
-     4. Research & publications
-     5. News & regulatory
-   - Weekly adds: **week-in-review** executive summary, most active entities
-   - Monthly adds: **trends & patterns** section with counts (index launches per competitor, ETF actions per client)
-   - Handle empty sections (omit from digest)
-
-2. `digest/summariser.py`:
-   - If `ANTHROPIC_API_KEY` is set:
-     - Call Claude API to generate per-section summaries (2–3 sentences)
-     - Generate one-line summary for each item
-     - For weekly/monthly: generate a higher-level thematic summary
-     - Prompt: factual, concise, highlight competitive implications for FTSE Russell
-     - Budget: ~4K output tokens (daily), ~6K (weekly), ~8K (monthly)
-   - If no API key:
-     - Skip AI summaries
-     - Digest still works — just lists items by category without narrative
-
-3. `digest/renderer.py`:
-   - Jinja2 markdown templates (one base template, conditional sections for weekly/monthly):
-     - Header with date range and item count
-     - Executive summary (if AI available)
-     - Market commentary section (new — gives broader context)
-     - Each category section: section summary + item list
-     - Each item: title, source, entity, date, link
-     - Monthly: entity activity table (who did what, how many items)
-     - Footer with collector stats
-   - Output paths:
-     - Daily: `digests/daily/YYYY-MM-DD.md`
-     - Weekly: `digests/weekly/YYYY-Wnn.md`
-     - Monthly: `digests/monthly/YYYY-MM.md`
-
-4. CLI commands:
-   ```
-   caleidoscope digest                    # daily (default), save + print
-   caleidoscope digest --weekly           # last 7 days
-   caleidoscope digest --monthly          # last calendar month
-   caleidoscope digest --preview          # print only, don't save
-   caleidoscope digest --save             # save only, don't print
-   ```
-
-5. Tests: mock LLM responses; verify template rendering for all three cadences; verify no-API-key fallback.
-
-**Deliverable**: `caleidoscope digest` produces daily briefings; `--weekly` and `--monthly` produce longer-range summaries.
-
----
-
-## Step 8: Orchestration & Scheduling
-
-**What**: Wire everything together for automated daily runs.
-
-**Actions**:
-1. `cli.py` — add `run-all` command:
-   ```
-   caleidoscope run-all    # collect all sources, then generate digest
-   caleidoscope collect --all
-   caleidoscope digest
-   ```
-
-2. Document crontab setup:
-   ```cron
-   # Run all collectors at 05:00 UTC (06:00 BST) on weekdays
-   0 5 * * 1-5  cd /path/to/caleidoscope && python -m caleidoscope collect --all >> logs/collect.log 2>&1
-
-   # Generate daily digest at 06:00 UTC (07:00 BST) on weekdays
-   0 6 * * 1-5  cd /path/to/caleidoscope && python -m caleidoscope digest >> logs/digest.log 2>&1
-
-   # Generate weekly digest on Monday at 06:30 UTC
-   30 6 * * 1  cd /path/to/caleidoscope && python -m caleidoscope digest --weekly >> logs/digest.log 2>&1
-
-   # Generate monthly digest on 1st of each month at 07:00 UTC
-   0 7 1 * *  cd /path/to/caleidoscope && python -m caleidoscope digest --monthly >> logs/digest.log 2>&1
-   ```
-
-3. Add `--verbose` / `--quiet` flags for logging control.
-
-4. Collection summary: print stats at end (X items collected, Y new, Z duplicates, N errors).
-
-**Deliverable**: End-to-end automated: collectors run overnight, digest ready by morning.
-
----
-
-## Step 9: Polish & Testing
-
-**What**: Harden, test, and document.
-
-**Actions**:
-1. Integration test: run all collectors against real sites (as a manual test, not in CI).
-2. Verify FTS5 search quality with realistic queries.
-3. Verify digest output reads well with real data.
-4. Add `caleidoscope status` command: show DB stats, last collection time, item counts by source.
-5. Write setup instructions in README:
-   - Install: `pip install -e .`
-   - Initialise: `caleidoscope init-db`
-   - First run: `caleidoscope collect --all && caleidoscope digest`
-   - Schedule: crontab instructions
-   - Optional: set `ANTHROPIC_API_KEY` for AI summaries
-   - Adding new sources
-
-**Deliverable**: Solid, documented MVP that runs with zero credentials.
-
----
-
-## Step Dependency Graph
+Three agents build in parallel. Each owns distinct files. They share a contract (defined below) so their code integrates cleanly.
 
 ```
-Step 0 (scaffolding)
-  |
-  v
-Step 1 (SQLite + FTS5)
-  |
-  v
-Step 2 (base collector framework)
-  |
-  +---> Step 3 (MSCI, S&P DJI, STOXX)
-  |
-  +---> Step 4 (BlackRock, Google News, ETF Stream)
-  |
-  +---> Step 5 (SEC EDGAR)
-  |
-  +---> Step 6 (search engine) -- can be built in parallel with 3-5
-  |
-  v  (after 3, 4, 5 done)
-Step 7 (digest generator)
-  |
-  v
-Step 8 (orchestration)
-  |
-  v
-Step 9 (polish & docs)
+Agent 1: FOUNDATION          Agent 2: COLLECTORS           Agent 3: SEARCH + DIGEST
+─────────────────────        ─────────────────────         ─────────────────────
+pyproject.toml               collectors/msci.py            search/__init__.py
+config.yaml                  collectors/sp_dji.py          search/engine.py
+.env.example                 collectors/stoxx.py           digest/__init__.py
+src/caleidoscope/            collectors/blackrock.py       digest/generator.py
+  __init__.py                collectors/edgar.py           digest/summariser.py
+  __main__.py                collectors/google_news.py     digest/renderer.py
+  config.py                  collectors/market_news.py     digest/templates/
+  cli.py                     collectors/etf_news.py          daily.md.j2
+  db/__init__.py             tests/                          weekly.md.j2
+  db/models.py                 conftest.py                   monthly.md.j2
+  db/session.py                test_collectors.py          tests/
+  collectors/__init__.py                                     test_search.py
+  collectors/base.py                                         test_digest.py
+  collectors/rss.py
+  processing/__init__.py
+  processing/normaliser.py
+  processing/tagger.py
+  tests/
+    test_db.py
+    test_processing.py
 ```
-
-Steps 3, 4, 5, and 6 can all be developed in parallel once Step 2 is complete.
 
 ---
 
-## What the Digests Will Look Like
+## Shared Contracts
 
-### Daily digest (with AI summaries):
+All agents MUST use these exact interfaces so the code integrates.
 
+### Contract 1: Database Models (`db/models.py`)
+
+Agent 1 creates these. Agents 2 and 3 import from them.
+
+```python
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy import Text, Integer
+import uuid
+from datetime import datetime
+
+class Base(DeclarativeBase):
+    pass
+
+class Item(Base):
+    __tablename__ = "items"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True, default=lambda: str(uuid.uuid4()))
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    url_hash: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    published_at: Mapped[str | None] = mapped_column(Text, nullable=True)       # ISO 8601
+    collected_at: Mapped[str] = mapped_column(Text, nullable=False)             # ISO 8601
+    source: Mapped[str] = mapped_column(Text, nullable=False)                   # 'msci', 'sp_dji', etc.
+    entity: Mapped[str | None] = mapped_column(Text, nullable=True)             # 'MSCI', 'BlackRock', etc.
+    category: Mapped[str | None] = mapped_column(Text, nullable=True)           # 'index_launch', 'research', etc.
+    body: Mapped[str | None] = mapped_column(Text, nullable=True)               # cleaned text
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)            # LLM-generated
+    tags: Mapped[str | None] = mapped_column(Text, nullable=True)               # JSON: '["ESG","ACWI"]'
+    raw_html_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+class DigestLog(Base):
+    __tablename__ = "digest_log"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True, default=lambda: str(uuid.uuid4()))
+    generated_at: Mapped[str] = mapped_column(Text, nullable=False)
+    cadence: Mapped[str] = mapped_column(Text, nullable=False)                  # 'daily', 'weekly', 'monthly'
+    item_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    digest_md: Mapped[str | None] = mapped_column(Text, nullable=True)
+```
+
+### Contract 2: RawItem pydantic model (`collectors/base.py`)
+
+Agent 1 creates this. Agent 2 returns lists of these from every collector.
+
+```python
+from pydantic import BaseModel
+from datetime import datetime
+
+class RawItem(BaseModel):
+    title: str
+    url: str
+    published_at: datetime | None = None
+    source: str                          # e.g. 'msci', 'sp_dji', 'edgar'
+    entity: str | None = None            # e.g. 'MSCI', 'S&P DJI'
+    category: str | None = None          # e.g. 'index_launch', 'research', 'news'
+    body: str | None = None              # cleaned text content
+    tags: list[str] | None = None        # e.g. ['ESG', 'ACWI']
+
+class CollectorResult(BaseModel):
+    collector_name: str
+    items_found: int = 0
+    items_new: int = 0
+    items_duplicate: int = 0
+    errors: list[str] = []
+```
+
+### Contract 3: BaseCollector abstract class (`collectors/base.py`)
+
+```python
+from abc import ABC, abstractmethod
+
+class BaseCollector(ABC):
+    name: str           # e.g. 'msci'
+    entity: str | None  # e.g. 'MSCI' — can be None for news sources
+
+    @abstractmethod
+    async def collect(self) -> list[RawItem]:
+        """Fetch and return raw items from this source."""
+        ...
+```
+
+Agent 1 provides the `run()` orchestration method on BaseCollector that:
+1. Calls `self.collect()` to get RawItems
+2. Passes through normaliser (strip HTML, clean whitespace)
+3. Passes through tagger (auto-detect entity/category from keywords)
+4. Deduplicates via url_hash
+5. Inserts new items into SQLite
+6. Returns CollectorResult with stats
+
+### Contract 4: DB Session (`db/session.py`)
+
+```python
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+
+def get_engine(db_path: str = "data/caleidoscope.db"):
+    """Return SQLAlchemy engine for the SQLite database."""
+    ...
+
+def get_session(db_path: str | None = None) -> Session:
+    """Return a new DB session."""
+    ...
+
+def init_db(db_path: str | None = None):
+    """Create all tables, FTS5 virtual table, and triggers."""
+    ...
+```
+
+### Contract 5: Config (`config.py`)
+
+```python
+from pydantic import BaseModel
+
+class SourceConfig(BaseModel):
+    name: str
+    entity: str | None = None
+    enabled: bool = True
+    urls: list[str] = []
+    category_default: str | None = None
+
+class Config(BaseModel):
+    db_path: str = "data/caleidoscope.db"
+    sources: list[SourceConfig] = []
+    digest_dir: str = "digests"
+    anthropic_api_key: str | None = None
+    rate_limit_seconds: float = 2.0
+
+def load_config(config_path: str = "config.yaml") -> Config:
+    ...
+```
+
+### Contract 6: Category Values
+
+All agents use these exact category strings:
+
+- `index_launch`
+- `methodology_change`
+- `etf_launch`
+- `etf_closure`
+- `fee_change`
+- `research`
+- `regulatory`
+- `news`
+- `market_commentary`
+
+### Contract 7: Search Engine (`search/engine.py`)
+
+Agent 3 creates this. The CLI (Agent 1) calls it.
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class SearchResult:
+    id: str
+    title: str
+    url: str
+    source: str
+    entity: str | None
+    category: str | None
+    published_at: str | None
+    snippet: str | None
+
+def search(
+    query: str,
+    db_path: str | None = None,
+    source: str | None = None,
+    entity: str | None = None,
+    category: str | None = None,
+    since: str | None = None,       # ISO date or relative like "7d", "30d"
+    limit: int = 20,
+    offset: int = 0,
+) -> list[SearchResult]:
+    ...
+```
+
+### Contract 8: Digest Functions (`digest/generator.py`)
+
+Agent 3 creates this. The CLI (Agent 1) calls it.
+
+```python
+def generate_digest(
+    cadence: str = "daily",         # "daily", "weekly", "monthly"
+    db_path: str | None = None,
+    save: bool = True,
+    digest_dir: str = "digests",
+    anthropic_api_key: str | None = None,
+) -> str:
+    """Generate digest markdown. Returns the markdown string.
+    If save=True, writes to digest_dir/{cadence}/filename.md"""
+    ...
+```
+
+---
+
+## Agent 1: Foundation
+
+**Files to create:**
+- `pyproject.toml`
+- `config.yaml`
+- `.env.example`
+- `src/caleidoscope/__init__.py`
+- `src/caleidoscope/__main__.py`
+- `src/caleidoscope/config.py`
+- `src/caleidoscope/cli.py`
+- `src/caleidoscope/db/__init__.py`
+- `src/caleidoscope/db/models.py`
+- `src/caleidoscope/db/session.py`
+- `src/caleidoscope/collectors/__init__.py`
+- `src/caleidoscope/collectors/base.py`
+- `src/caleidoscope/collectors/rss.py`
+- `src/caleidoscope/processing/__init__.py`
+- `src/caleidoscope/processing/normaliser.py`
+- `src/caleidoscope/processing/tagger.py`
+- `tests/test_db.py`
+- `tests/test_processing.py`
+
+**Responsibilities:**
+1. pyproject.toml with all dependencies (httpx, beautifulsoup4, feedparser, sqlalchemy, pyyaml, pydantic, typer, jinja2, anthropic as optional)
+2. Config loading (YAML + env vars)
+3. SQLite database: models, session factory, init_db with FTS5 + triggers
+4. BaseCollector with full run() pipeline (collect → normalise → tag → dedup → store)
+5. RSSCollector (generic, reusable) extending BaseCollector
+6. Normaliser: strip HTML, clean whitespace, generate url_hash
+7. Tagger: keyword-based category and entity detection
+8. CLI with Typer — all commands (init-db, collect, search, digest, run-all, status)
+   - CLI is the shell that calls into Agent 2's collectors and Agent 3's search/digest
+   - For collect: dynamically discovers all collector classes registered in collectors/__init__.py
+   - For search: calls `search.engine.search()`
+   - For digest: calls `digest.generator.generate_digest()`
+9. Tests for DB operations and processing pipeline
+
+**The CLI commands:**
+```
+caleidoscope init-db                          # create SQLite DB
+caleidoscope collect --all                    # run all collectors
+caleidoscope collect --source msci,edgar      # run specific collectors
+caleidoscope search "MSCI ESG" --since 7d    # search
+caleidoscope digest                           # daily, save + print
+caleidoscope digest --weekly                  # weekly
+caleidoscope digest --monthly                 # monthly
+caleidoscope digest --preview                 # print only
+caleidoscope run-all                          # collect --all + digest
+caleidoscope status                           # DB stats
+```
+
+---
+
+## Agent 2: All Collectors
+
+**Files to create:**
+- `src/caleidoscope/collectors/msci.py`
+- `src/caleidoscope/collectors/sp_dji.py`
+- `src/caleidoscope/collectors/stoxx.py`
+- `src/caleidoscope/collectors/blackrock.py`
+- `src/caleidoscope/collectors/edgar.py`
+- `src/caleidoscope/collectors/google_news.py`
+- `src/caleidoscope/collectors/market_news.py`
+- `src/caleidoscope/collectors/etf_news.py`
+- `tests/conftest.py` (shared fixtures)
+- `tests/test_collectors.py`
+
+**Each collector extends BaseCollector and implements `async def collect() -> list[RawItem]`.**
+
+### MSCI (`msci.py`)
+- name = "msci", entity = "MSCI"
+- Scrape `msci.com` press releases and announcements page
+- Scrape research/insights listing
+- Categories: `index_launch`, `methodology_change`, `research`
+
+### S&P DJI (`sp_dji.py`)
+- name = "sp_dji", entity = "S&P DJI"
+- Scrape `spglobal.com/spdji` press releases
+- Look for RSS feed; fall back to HTML scraping
+- Categories: `index_launch`, `methodology_change`, `research`
+
+### STOXX (`stoxx.py`)
+- name = "stoxx", entity = "STOXX"
+- Scrape `stoxx.com` announcements / media list
+- Categories: `index_launch`, `methodology_change`
+
+### BlackRock/iShares (`blackrock.py`)
+- name = "blackrock", entity = "BlackRock"
+- Scrape iShares press releases / product announcements
+- Parse RSS if available
+- Categories: `etf_launch`, `etf_closure`, `fee_change`, `research`
+
+### SEC EDGAR (`edgar.py`)
+- name = "edgar", entity = None (entity derived from filer)
+- Use EDGAR full-text search API: `https://efts.sec.gov/LATEST/search-index?q=...`
+- Search for form types N-1A, 19b-4 with keywords "index", "ETF"
+- Set User-Agent header (SEC requirement): `Caleidoscope/0.1 (contact@example.com)`
+- Category: `regulatory`
+- Rate limit: 1 request per 2 seconds
+
+### Google News (`google_news.py`)
+- name = "google_news", entity = None
+- Use Google News RSS: `https://news.google.com/rss/search?q=...`
+- Query terms: "MSCI index", "S&P index launch", "FTSE Russell", "ETF launch", "ESG index", "index methodology"
+- Category: `news`
+
+### Market News (`market_news.py`)
+- name = "market_news", entity = None
+- Aggregate multiple RSS feeds via the generic RSSCollector:
+  - Reuters business/finance RSS
+  - Yahoo Finance RSS
+  - Morningstar articles RSS
+- Category: `market_commentary`
+
+### ETF News (`etf_news.py`)
+- name = "etf_news", entity = None
+- Aggregate RSS feeds:
+  - ETF Stream
+  - ETF.com
+  - ETF Trends
+- Category: `news` (may be retagged to `etf_launch` by tagger)
+
+### Test approach:
+- `conftest.py`: shared fixtures (mock httpx client, sample RSS XML, sample HTML)
+- `test_collectors.py`: for each collector, feed it saved HTML/RSS fixture, verify it returns correct RawItems
+- No real network calls in tests
+
+---
+
+## Agent 3: Search + Digest
+
+**Files to create:**
+- `src/caleidoscope/search/__init__.py`
+- `src/caleidoscope/search/engine.py`
+- `src/caleidoscope/digest/__init__.py`
+- `src/caleidoscope/digest/generator.py`
+- `src/caleidoscope/digest/summariser.py`
+- `src/caleidoscope/digest/renderer.py`
+- `src/caleidoscope/digest/templates/daily.md.j2`
+- `src/caleidoscope/digest/templates/weekly.md.j2`
+- `src/caleidoscope/digest/templates/monthly.md.j2`
+- `tests/test_search.py`
+- `tests/test_digest.py`
+
+### Search Engine (`search/engine.py`)
+- FTS5 MATCH queries against items_fts virtual table
+- Support filters: source, entity, category, since (date)
+- Snippet extraction using FTS5 `snippet()` function
+- Results ranked by FTS5 rank, date as tiebreaker
+- Pagination (limit/offset)
+- Function signature per Contract 7
+
+### Digest Generator (`digest/generator.py`)
+- Three cadences: daily (last 24h), weekly (last 7d), monthly (last calendar month)
+- Query items for time window from SQLite
+- Group into sections by category:
+  1. market_commentary
+  2. index_launch + methodology_change
+  3. etf_launch + etf_closure + fee_change
+  4. research
+  5. regulatory + news
+- Count items per entity (for weekly/monthly entity activity table)
+- Pass to summariser, then to renderer
+- Save to digests/{cadence}/filename.md
+- Log to digest_log table
+- Function signature per Contract 8
+
+### Summariser (`digest/summariser.py`)
+- If `ANTHROPIC_API_KEY` available:
+  - Call Claude API to generate:
+    - Executive summary (2-3 sentences)
+    - Per-section narrative (2-3 sentences each)
+    - One-line summary per item
+  - Prompt: "You are a market intelligence analyst at FTSE Russell. Summarise these items factually and concisely. Highlight competitive implications."
+  - Budget: ~4K tokens daily, ~6K weekly, ~8K monthly
+- If no API key:
+  - Return None for all summaries (renderer handles this gracefully)
+
+### Renderer (`digest/renderer.py`)
+- Load Jinja2 templates from digest/templates/
+- Templates:
+  - `daily.md.j2` — standard sections
+  - `weekly.md.j2` — adds "Week in Review" + entity activity table
+  - `monthly.md.j2` — adds "Trends & Patterns" + full entity activity table
+- All templates handle missing AI summaries (just omit narrative blocks)
+- Render to markdown string
+
+### Jinja2 template structure (daily.md.j2 example):
 ```markdown
-# Caleidoscope Daily Brief — Wednesday 12 February 2026
+# Caleidoscope Daily Brief — {{ date }}
 
-> 18 new items collected | 0 collector errors
+> {{ item_count }} new items collected | {{ error_count }} collector errors
 
+{% if executive_summary %}
 ## Executive Summary
 
-MSCI published a consultation on ACWI IMI rebalancing frequency. S&P DJI
-announced a new ESG Ultra index. BlackRock cut fees on three core iShares
-ETFs. Markets broadly flat; ECB minutes hinted at June rate decision.
+{{ executive_summary }}
 
 ---
+{% endif %}
 
-## Market Commentary (4 items)
+{% for section in sections %}
+{% if section.items %}
+## {{ section.title }} ({{ section.items | length }} items)
 
-US equities closed flat ahead of CPI data. European markets edged higher
-on ECB minutes suggesting a June rate pause. Oil steady at $78. The dollar
-index weakened slightly against the euro.
+{% if section.summary %}
+{{ section.summary }}
 
-- **US Stocks Tread Water Ahead of Inflation Data**
-  Reuters | 11 Feb 2026 | [link](https://reuters.com/...)
-
-- **ECB Minutes Signal Patience on Rate Cuts**
-  Yahoo Finance | 11 Feb 2026 | [link](https://finance.yahoo.com/...)
-
-- **European Markets Edge Higher on ECB Optimism**
-  Reuters | 11 Feb 2026 | [link](https://reuters.com/...)
-
-- **Dollar Weakens as Traders Await CPI Release**
-  Morningstar | 11 Feb 2026 | [link](https://morningstar.com/...)
+{% endif %}
+{% for item in section.items %}
+- **{{ item.title }}**
+  {{ item.source }}{% if item.entity %} ({{ item.entity }}){% endif %} | {{ item.published_at }} | [link]({{ item.url }})
+{% endfor %}
 
 ---
-
-## Index Launches & Methodology Changes (2 items)
-
-MSCI is consulting on ACWI IMI rebalancing frequency, potentially moving
-from quarterly to monthly. S&P DJI announced a new S&P 500 ESG Ultra
-index targeting the top ESG quintile.
-
-- **MSCI Consultation: ACWI IMI Rebalancing Frequency Review**
-  MSCI | 11 Feb 2026 | [link](https://msci.com/...)
-
-- **S&P DJI Launches S&P 500 ESG Ultra Index**
-  S&P DJI | 11 Feb 2026 | [link](https://spglobal.com/...)
-
----
-
-## ETF Product Actions (3 items)
-
-BlackRock reduced expense ratios on IWDA, EIMI, and SWDA by 1-2bps,
-continuing fee compression in core equity ETFs.
-
-- **iShares Cuts Fees on Three Core World ETFs**
-  BlackRock | 11 Feb 2026 | [link](https://blackrock.com/...)
-
-- **Amundi Launches Euro Government Green Bond ETF**
-  Amundi | 11 Feb 2026 | [link](https://amundi.com/...)
-
----
-
-## Research & Publications (1 item)
-
-- **Factor Investing in a Higher-Rate Environment**
-  MSCI Research | 11 Feb 2026 | [link](https://msci.com/...)
-
----
-
-## News & Regulatory (4 items)
-
-European regulators are considering stricter ESG index labelling
-requirements, potentially affecting Article 8/9 fund benchmarks.
-
-- **EU Regulators Eye Tighter ESG Index Rules**
-  Google News (FT) | 11 Feb 2026 | [link](https://ft.com/...)
-
-- **European ETF Market Hits EUR 2T Milestone**
-  ETF Stream | 11 Feb 2026 | [link](https://etfstream.com/...)
-
----
+{% endif %}
+{% endfor %}
 *Generated by Caleidoscope v0.1*
 ```
 
-### Daily digest (without AI — no API key, still useful):
-
-```markdown
-# Caleidoscope Daily Brief — Wednesday 12 February 2026
-
-> 18 new items collected | 0 collector errors
-
----
-
-## Market Commentary (4 items)
-
-- **US Stocks Tread Water Ahead of Inflation Data**
-  Reuters | 11 Feb 2026 | [link](https://reuters.com/...)
-
-- **ECB Minutes Signal Patience on Rate Cuts**
-  Yahoo Finance | 11 Feb 2026 | [link](https://finance.yahoo.com/...)
-
-[...]
-
----
-
-## Index Launches & Methodology Changes (2 items)
-
-- **MSCI Consultation: ACWI IMI Rebalancing Frequency Review**
-  MSCI | 11 Feb 2026 | [link](https://msci.com/...)
-
-[...]
-
----
-*Generated by Caleidoscope v0.1*
-```
-
-### Weekly digest (Monday morning):
-
-```markdown
-# Caleidoscope Weekly Brief — Week 7 (10–14 Feb 2026)
-
-> 73 items this week | Sources: 8 active | 2 collector warnings
-
-## Week in Review
-
-Active week for index methodology. MSCI opened two consultations (ACWI IMI
-rebalancing, EM index treatment of India). S&P DJI launched 3 new ESG
-indices. BlackRock cut fees on core ETFs for the second time in 6 months.
-SEC received 4 new N-1A filings for thematic ETFs.
-
-Markets: S&P 500 +1.2%, STOXX 600 +0.8%. ECB signalled patience on cuts.
-
----
-
-## Market Commentary Highlights (22 items)
-
-Key themes: ECB rate path uncertainty, US CPI surprise to the downside,
-continued rotation into value. Oil volatile on Middle East tensions.
-
-- **US CPI Comes in Below Expectations at 2.1%** — Reuters | 12 Feb
-- **ECB Minutes Signal Patience on Rate Cuts** — Yahoo Finance | 11 Feb
-- **Value Stocks Outperform Growth for Third Straight Week** — Morningstar | 14 Feb
-[...]
-
----
-
-## Index Launches & Methodology Changes (5 items)
-[...]
-
-## Entity Activity This Week
-
-| Entity | Index launches | ETF actions | Research | Total |
-|--------|---------------|-------------|----------|-------|
-| MSCI | 2 | 0 | 1 | 3 |
-| S&P DJI | 3 | 0 | 0 | 3 |
-| BlackRock | 0 | 3 | 1 | 4 |
-| STOXX | 1 | 0 | 0 | 1 |
-
----
-*Generated by Caleidoscope v0.1*
-```
-
-### Monthly digest (1st business day):
-
-```markdown
-# Caleidoscope Monthly Brief — February 2026
-
-> 287 items this month | Sources: 8 active
-
-## Month in Review
-
-February saw heightened activity in ESG index methodology across all major
-providers. MSCI opened 4 consultations. S&P DJI launched 7 new indices (3 ESG,
-2 thematic, 2 fixed income). BlackRock and Amundi both made fee cuts. SEC
-filings suggest a pipeline of 12 new thematic ETFs.
-
-## Trends & Patterns
-
-- ESG index launches up 40% vs January (9 vs 6)
-- Fee compression continues: 3 providers cut fees on 8 ETFs
-- Thematic ETF filings accelerating (12 new N-1A, up from 7 in Jan)
-- MSCI most active on methodology changes (4 consultations)
-
-## Entity Activity — February 2026
-
-| Entity | Index | Methodology | ETF actions | Research | News | Total |
-|--------|-------|-------------|-------------|----------|------|-------|
-| MSCI | 3 | 4 | 0 | 2 | 12 | 21 |
-| S&P DJI | 7 | 1 | 0 | 3 | 8 | 19 |
-| STOXX | 2 | 1 | 0 | 0 | 3 | 6 |
-| BlackRock | 0 | 0 | 5 | 2 | 15 | 22 |
-
-[... full item listings by category ...]
-
----
-*Generated by Caleidoscope v0.1*
-```
-
----
-
-## Decisions Already Made
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Database | SQLite + FTS5 | Zero config, single file, no server, built-in full-text search |
-| Phase 1 credentials | None required | All sources are free/public; LSEG, FT, email move to Phase 2 |
-| Digest delivery | Markdown file + terminal | No SMTP needed; email added in Phase 2 |
-| LLM | Optional (Claude API) | Works without it; AI summaries are a bonus, not a requirement |
-| Hosting | Any machine with Python + cron | Laptop, server, VM — no Docker required for Phase 1 |
-| Web UI | Phase 2 | CLI + markdown is sufficient for a single user in Phase 1 |
-
-## Open Decisions
-
-| # | Decision | Options | Notes |
-|---|----------|---------|-------|
-| 1 | **Which sites actually have usable RSS?** | Need to probe each site | First task in Step 3; determines scrape vs RSS per source |
-| 2 | **Playwright needed?** | Only if key sites are JS-rendered SPAs | Test with httpx first; add Playwright per-collector if needed |
-| 3 | **Google News RSS still working?** | Test it | Google has deprecated/changed this before; need a fallback plan |
-
----
-
-## Phase 2 Preview (not in scope for MVP)
-
-When you're ready to add credentials, the following modules slot in:
-
-| Feature | What's needed | Files to add/modify |
-|---------|--------------|-------------------|
-| LSEG ETF flows | `LSEG_APP_KEY`, `LSEG_USERNAME`, `LSEG_PASSWORD` | `collectors/lseg_flows.py`, config entry |
-| FT articles | `FT_SESSION_COOKIE` or FT API key | `collectors/ft.py`, config entry |
-| Email digest | `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, `DIGEST_RECIPIENTS` | `digest/mailer.py`, CLI `--send` flag |
-| Remaining clients | Nothing (free scrape) | `collectors/vanguard.py`, `invesco.py`, `amundi.py`, `franklin.py` |
+### Tests:
+- `test_search.py`: seed SQLite with test items, verify search returns correct results, test filters
+- `test_digest.py`: seed DB, generate digest, verify markdown output, test all 3 cadences, test with/without API key
