@@ -2,26 +2,21 @@
 
 ## Overview
 
-This plan breaks the MVP (Phase 1 from the PRD) into concrete, ordered implementation steps. Each step produces a working, testable increment.
+This plan covers the Phase 1 MVP: **free sources only, SQLite, no credentials required**. Each step produces a working, testable increment. LLM summarisation is optional (works if you set `ANTHROPIC_API_KEY`, gracefully skipped otherwise).
 
 ---
 
 ## Step 0: Project Scaffolding
 
-**What**: Set up the Python project structure, dependencies, configuration, and Docker environment.
+**What**: Set up the Python project structure, dependencies, and configuration.
 
 **Actions**:
-1. Initialise project layout:
+1. Create project layout:
    ```
    caleidoscope/
    ├── pyproject.toml              # Project metadata, dependencies
-   ├── docker-compose.yml          # Postgres + app services
-   ├── Dockerfile
-   ├── .env.example                # Template for secrets
-   ├── config.yaml                 # Source definitions, schedule, recipients
-   ├── alembic.ini                 # DB migration config
-   ├── alembic/
-   │   └── versions/
+   ├── config.yaml                 # Source definitions, schedule config
+   ├── .env.example                # Template for optional env vars
    ├── src/
    │   └── caleidoscope/
    │       ├── __init__.py
@@ -29,32 +24,31 @@ This plan breaks the MVP (Phase 1 from the PRD) into concrete, ordered implement
    │       ├── config.py           # Load YAML + env vars
    │       ├── db/
    │       │   ├── __init__.py
-   │       │   ├── models.py       # SQLAlchemy models
-   │       │   └── session.py      # DB session factory
+   │       │   ├── models.py       # SQLAlchemy models (SQLite)
+   │       │   └── session.py      # DB session/engine factory
    │       ├── collectors/
    │       │   ├── __init__.py
    │       │   ├── base.py         # Abstract collector class
+   │       │   ├── rss.py          # Generic RSS collector
    │       │   ├── msci.py
    │       │   ├── sp_dji.py
    │       │   ├── stoxx.py
    │       │   ├── blackrock.py
-   │       │   ├── ft.py
-   │       │   ├── lseg_flows.py
-   │       │   └── rss.py          # Generic RSS collector
+   │       │   ├── edgar.py
+   │       │   └── google_news.py
    │       ├── processing/
    │       │   ├── __init__.py
    │       │   ├── normaliser.py   # Clean, normalise, deduplicate
    │       │   └── tagger.py       # Auto-categorise and tag
    │       ├── search/
    │       │   ├── __init__.py
-   │       │   └── engine.py       # Full-text search queries
+   │       │   └── engine.py       # FTS5 search queries
    │       ├── digest/
    │       │   ├── __init__.py
    │       │   ├── generator.py    # Compile digest from DB
-   │       │   ├── summariser.py   # LLM summarisation
-   │       │   ├── renderer.py     # Markdown + HTML templates
-   │       │   └── mailer.py       # Send email via SMTP/SendGrid
-   │       └── cli.py              # Click/Typer CLI commands
+   │       │   ├── summariser.py   # LLM summarisation (optional)
+   │       │   └── renderer.py     # Markdown templates
+   │       └── cli.py              # Typer CLI commands
    └── tests/
        ├── conftest.py
        ├── test_collectors/
@@ -63,63 +57,50 @@ This plan breaks the MVP (Phase 1 from the PRD) into concrete, ordered implement
        └── test_digest/
    ```
 
-2. Define dependencies in `pyproject.toml`:
-   - Core: `httpx`, `beautifulsoup4`, `feedparser`, `sqlalchemy[asyncio]`, `psycopg[binary]`, `alembic`, `pyyaml`, `pydantic`, `typer`
-   - Scraping: `playwright` (for JS-heavy pages)
-   - Data: `lseg-data` (LSEG Data Library)
-   - LLM: `anthropic` (Claude API)
-   - Email: `jinja2` (templates), `sendgrid` or stdlib `smtplib`
-   - Dev: `pytest`, `pytest-asyncio`, `ruff`, `mypy`
+2. Dependencies in `pyproject.toml`:
+   - Core: `httpx`, `beautifulsoup4`, `feedparser`, `sqlalchemy`, `pyyaml`, `pydantic`, `typer[all]`
+   - Optional: `anthropic` (for LLM summaries — not required)
+   - Dev: `pytest`, `ruff`
+   - No Playwright initially (add only if a specific site needs JS rendering)
 
-3. Create `docker-compose.yml` with:
-   - PostgreSQL 16 service
-   - App service (Python)
-   - Volume for Postgres data persistence
-
-4. Create `.env.example` with placeholders:
+3. Create `.env.example`:
    ```
-   DATABASE_URL=postgresql://caleidoscope:secret@localhost:5432/caleidoscope
-   LSEG_APP_KEY=
-   LSEG_USERNAME=
-   LSEG_PASSWORD=
-   ANTHROPIC_API_KEY=
-   SMTP_HOST=
-   SMTP_PORT=
-   SMTP_USER=
-   SMTP_PASS=
-   DIGEST_RECIPIENTS=you@example.com
-   FT_SESSION_COOKIE=
+   # All optional for Phase 1
+   ANTHROPIC_API_KEY=         # Optional: enables AI summaries in digest
+   CALEIDOSCOPE_DB=data/caleidoscope.db  # Default DB location
    ```
 
-5. Create `config.yaml` with source definitions and defaults.
+4. Create `config.yaml` with source definitions and category keywords.
 
-**Deliverable**: `docker-compose up` starts Postgres; `pip install -e .` installs the package; `caleidoscope --help` shows CLI.
+**Deliverable**: `pip install -e .` installs the package; `caleidoscope --help` shows CLI; no external services needed.
 
 ---
 
-## Step 1: Database Models & Migrations
+## Step 1: Database Setup (SQLite + FTS5)
 
-**What**: Define the data model and create the initial database schema.
+**What**: Create the SQLite database with FTS5 full-text search.
 
 **Actions**:
-1. Implement SQLAlchemy models in `db/models.py`:
-   - `Item` model (matches schema from PRD Section 10)
-   - `DigestLog` model
-   - Full-text search trigger to auto-update `search_vector` on insert/update
+1. `db/models.py` — SQLAlchemy models:
+   - `Item` model: id (UUID text), url, url_hash, title, published_at, collected_at, source, entity, category, body, summary, tags (JSON text), raw_html_path
+   - `DigestLog` model: id, generated_at, item_count, digest_md
 
-2. Configure Alembic and generate initial migration.
+2. `db/session.py`:
+   - `get_engine()` — creates SQLite engine pointing to `data/caleidoscope.db`
+   - `init_db()` — creates tables + FTS5 virtual table + triggers (see PRD Section 10)
+   - `get_session()` — returns a session
 
-3. Write `db/session.py` — async session factory using `create_async_engine`.
+3. CLI command: `caleidoscope init-db` — creates the database file and schema.
 
-4. Test: migration runs cleanly; can insert and query an item.
+4. Test: init-db creates file; can insert and query an item; FTS5 search works.
 
-**Deliverable**: `alembic upgrade head` creates all tables with indices.
+**Deliverable**: `caleidoscope init-db` creates a working SQLite database with full-text search.
 
 ---
 
 ## Step 2: Base Collector Framework
 
-**What**: Build the abstract collector class and the normalisation/dedup pipeline.
+**What**: Build the abstract collector class and normalisation/dedup pipeline.
 
 **Actions**:
 1. `collectors/base.py` — abstract base class:
@@ -131,377 +112,520 @@ This plan breaks the MVP (Phase 1 from the PRD) into concrete, ordered implement
        @abstractmethod
        async def collect(self) -> list[RawItem]: ...
 
-       async def run(self) -> CollectorResult:
+       async def run(self, session) -> CollectorResult:
            """Collect, normalise, deduplicate, store."""
    ```
    - `RawItem`: pydantic model with `title, url, date, source, entity, body, category`
    - Built-in retry logic (3 attempts, exponential backoff)
-   - Respects rate limiting (configurable delay between requests)
+   - Respects rate limiting (configurable delay between requests, default 2s per domain)
    - Logs stats: items found, new items stored, duplicates skipped, errors
 
 2. `collectors/rss.py` — generic RSS collector (reusable for any RSS feed):
    - Takes feed URL + entity/source config
-   - Parses with feedparser
-   - Returns list of RawItems
+   - Parses with `feedparser`
+   - Returns list of `RawItem`s
 
 3. `processing/normaliser.py`:
    - Strip HTML tags from body text
    - Normalise whitespace, encoding
-   - Generate URL hash for dedup
+   - Generate URL hash (SHA-256) for dedup
    - Check DB for existing hash before insert
 
 4. `processing/tagger.py`:
-   - Keyword-based category detection (configurable keyword → category mapping)
-   - Entity extraction via keyword lists (index names, ticker symbols)
+   - Keyword-based category detection (configurable keyword-to-category mapping in `config.yaml`)
+   - Entity detection via keyword lists (e.g., body mentions "MSCI" → entity tag)
 
-5. Tests with mock HTTP responses.
+5. Tests with mock HTTP responses (no real network calls in tests).
 
-**Deliverable**: Can run a collector against a mock source, see items appear in DB with correct tags.
+**Deliverable**: Can run a collector against a mock source, see items appear in SQLite with correct tags.
 
 ---
 
-## Step 3: First Collectors (MSCI, S&P DJI, STOXX)
+## Step 3: Competitor Collectors (MSCI, S&P DJI, STOXX)
 
-**What**: Implement the three competitor collectors.
+**What**: Implement collectors for the three main competitors. All free, no auth.
 
 **Actions**:
 1. **MSCI collector** (`collectors/msci.py`):
-   - Scrape `msci.com/index-announcements` for announcements
-   - Parse MSCI RSS/media feed for press releases
-   - Scrape `msci.com/research-and-insights` for research papers
+   - Parse MSCI press releases / media RSS feed
+   - Scrape `msci.com` announcements page for index-related news
+   - Scrape research/insights listing for new papers
    - Category mapping: announcement → `index_launch` / `methodology_change`; paper → `research`
 
 2. **S&P DJI collector** (`collectors/sp_dji.py`):
-   - Scrape `spglobal.com/spdji/en/media-center/press-releases/` for press releases
-   - Parse RSS for index announcements
-   - Scrape methodology change notices
-   - Monitor for consultation papers
+   - Parse `spglobal.com/spdji` press release RSS
+   - Scrape press room listing for index launches and methodology updates
+   - Monitor consultation/commentary pages
 
 3. **STOXX collector** (`collectors/stoxx.py`):
-   - Scrape `stoxx.com` announcements/media list
-   - Parse any available RSS
-   - Monitor rulebook updates
+   - Scrape `stoxx.com` announcements / media list
+   - Parse any available RSS feeds
+   - Monitor for rulebook updates
 
-4. For each: write a focused test with a saved HTML fixture to verify parsing logic is correct.
+4. For each: save an HTML fixture from the real site; write a test that parses the fixture.
 
 **Deliverable**: `caleidoscope collect --source msci,sp_dji,stoxx` populates DB with real items.
 
 ---
 
-## Step 4: Client Collector — BlackRock/iShares
+## Step 4: Client Collector — BlackRock/iShares + News
 
-**What**: Monitor the largest ETF issuer for product actions.
+**What**: Monitor BlackRock (largest ETF issuer) and add news sources.
 
 **Actions**:
 1. **BlackRock collector** (`collectors/blackrock.py`):
-   - Scrape iShares product announcements / press releases
-   - Monitor for new ETF listings (product page changes)
-   - Parse RSS feed for blog posts and insights
+   - Scrape iShares press releases / product announcements
+   - Parse RSS for blog posts and insights
    - Categories: `etf_launch`, `etf_closure`, `fee_change`, `research`
 
-2. Test with fixture.
-
-**Deliverable**: BlackRock items flowing into DB with correct categorisation.
-
----
-
-## Step 5: News Collector — Financial Times
-
-**What**: Ingest FT articles matching relevant keywords.
-
-**Actions**:
-1. **FT collector** (`collectors/ft.py`):
-   - Approach A (preferred): Use FT search/content API if available with subscription
-   - Approach B (fallback): Authenticated HTTP session using subscription cookies
-   - Search queries: "index launch", "ETF", "MSCI", "S&P index", "FTSE Russell", "passive investing", "ESG index"
-   - Extract: headline, snippet, URL, published date
-   - Respect FT terms — store headline + snippet + link, not full article body
+2. **Google News collector** (`collectors/google_news.py`):
+   - Configure Google News RSS URLs with relevant query terms:
+     - "index launch ETF", "MSCI index", "S&P index", "FTSE Russell",
+       "ETF launch", "passive investing", "ESG index", etc.
+   - Instance of generic RSS collector with custom URL builder
    - Category: `news`
 
-2. **Google News RSS collector** (instance of generic RSS collector):
-   - Configure Google News RSS URLs with relevant query terms
-   - Acts as catch-all for stories from other outlets
+3. **ETF Stream / ETF.com RSS** (instance of generic RSS collector):
+   - Configure feed URLs
+   - Category: `news` / `etf_launch`
 
-3. Test FT parser with fixture.
+4. **Market commentary collectors** (instances of generic RSS collector):
+   - Reuters RSS — market/finance section
+   - Yahoo Finance RSS — market commentary, ETF coverage
+   - Morningstar RSS — fund/ETF analysis
+   - Category: `market_commentary`
+   - These provide broader market context beyond competitor/client intel
 
-**Deliverable**: FT headlines and links appear in DB; Google News catches additional coverage.
+5. Tests with fixtures.
+
+**Deliverable**: `caleidoscope collect --all` populates DB from competitors, BlackRock, and news.
 
 ---
 
-## Step 6: LSEG Data Library — ETF Flows & AUM
+## Step 5: SEC EDGAR Collector
 
-**What**: Pull ETF flow and AUM data via the LSEG (Refinitiv) Data Library.
+**What**: Monitor SEC filings for ETF registrations and index-related rule changes.
 
 **Actions**:
-1. **LSEG collector** (`collectors/lseg_flows.py`):
-   - Authenticate using LSEG Data Library SDK (`lseg.data`)
-   - Pull daily ETF flow data for major ETFs tracking competitor/client indices
-   - Pull AUM snapshots
-   - Compute: top 10 gatherers, top 10 outflows, notable AUM milestones
-   - Store as items with category `etf_flow`
-   - Each "item" is a structured summary (e.g., "iShares MSCI World ETF: +$450M flows, AUM $58.2B")
+1. **EDGAR collector** (`collectors/edgar.py`):
+   - Use EDGAR FULL-TEXT search API (`efts.sec.gov/LATEST/search-index`)
+   - Search for recent filings matching:
+     - Form types: N-1A (ETF registration), 19b-4 (exchange rule filings for new indices)
+     - Keywords: "index", "ETF", entity names
+   - Extract: filing title, form type, filer name, date, URL to filing
+   - Category: `regulatory`
+   - Rate limit: SEC asks for max 10 requests/second (we'll do 1/2s to be safe)
+   - Set `User-Agent` header to identify the application (SEC requirement)
 
-2. Configure a watchlist of ETF RICs/ISINs in `config.yaml` covering:
-   - iShares/BlackRock products
-   - Vanguard products
-   - Invesco products
-   - Amundi products
-   - Franklin Templeton products
-   - Key FTSE Russell-benchmarked ETFs (for competitive awareness)
+2. Test with saved API response fixture.
 
-3. Test with LSEG sandbox/mock.
-
-**Deliverable**: Daily flow/AUM highlights stored as searchable items.
+**Deliverable**: SEC filings for ETF/index activity flowing into DB.
 
 ---
 
-## Step 7: Search Engine
+## Step 6: Search Engine (CLI)
 
-**What**: Implement the search interface.
+**What**: Implement full-text search via FTS5.
 
 **Actions**:
 1. `search/engine.py`:
-   - Build PostgreSQL full-text search queries using `plainto_tsquery` and `ts_rank`
+   - Build FTS5 `MATCH` queries from user input
    - Support filters: `source`, `entity`, `category`, `date_from`, `date_to`
-   - Return results ordered by relevance (with date as tiebreaker)
-   - Pagination support
+   - Return results ranked by FTS5 rank, with date as tiebreaker
+   - Snippet extraction using `snippet()` FTS5 function
+   - Pagination (default 20 results)
 
 2. `cli.py` — add search command:
    ```
    caleidoscope search "MSCI ESG" --since 7d --entity MSCI --category research
    caleidoscope search "fee change" --source blackrock --since 30d
+   caleidoscope search "19b-4" --source edgar
    ```
-   - Pretty-print results: title, source, date, snippet, URL
+   - Pretty-print results: title, source, entity, date, snippet, URL
 
-3. Tests against seeded DB.
+3. Tests against seeded SQLite DB.
 
-**Deliverable**: Can search the full archive from the command line with filters.
+**Deliverable**: Full-text search of the entire archive from the command line.
 
 ---
 
-## Step 8: Digest Generator & LLM Summarisation
+## Step 7: Digest Generator (Daily, Weekly, Monthly)
 
-**What**: Build the morning briefing pipeline.
+**What**: Build the briefing pipeline with three cadences.
 
 **Actions**:
 1. `digest/generator.py`:
-   - Query all items from last 24 hours (or since last digest)
+   - Three modes: `daily` (last 24h), `weekly` (last 7 days), `monthly` (last calendar month)
+   - Query items for the relevant time window
    - Group into sections:
-     1. Index launches & methodology changes
-     2. ETF product actions
-     3. AUM & flow highlights
+     1. **Market commentary** — broader market news, macro context, industry trends
+     2. Index launches & methodology changes
+     3. ETF product actions
      4. Research & publications
      5. News & regulatory
-   - Pass each section's items to the summariser
+   - Weekly adds: **week-in-review** executive summary, most active entities
+   - Monthly adds: **trends & patterns** section with counts (index launches per competitor, ETF actions per client)
+   - Handle empty sections (omit from digest)
 
 2. `digest/summariser.py`:
-   - Use Claude API (`anthropic` SDK) to generate:
-     - A 2–3 sentence section summary (what matters and why)
-     - A one-line summary for each individual item
-   - Prompt engineering: instruct model to be factual, concise, highlight competitive implications for FTSE Russell
-   - Token budget: keep total summarisation under ~4K output tokens per digest
-   - Handle empty sections gracefully (omit from digest)
+   - If `ANTHROPIC_API_KEY` is set:
+     - Call Claude API to generate per-section summaries (2–3 sentences)
+     - Generate one-line summary for each item
+     - For weekly/monthly: generate a higher-level thematic summary
+     - Prompt: factual, concise, highlight competitive implications for FTSE Russell
+     - Budget: ~4K output tokens (daily), ~6K (weekly), ~8K (monthly)
+   - If no API key:
+     - Skip AI summaries
+     - Digest still works — just lists items by category without narrative
 
 3. `digest/renderer.py`:
-   - Jinja2 templates for:
-     - **HTML email** (clean, mobile-friendly, uses inline CSS)
-     - **Markdown** (for archive and terminal viewing)
-   - Template sections: header with date, executive summary, then each category section
-   - Each item: title (hyperlinked), source badge, date, one-line summary
+   - Jinja2 markdown templates (one base template, conditional sections for weekly/monthly):
+     - Header with date range and item count
+     - Executive summary (if AI available)
+     - Market commentary section (new — gives broader context)
+     - Each category section: section summary + item list
+     - Each item: title, source, entity, date, link
+     - Monthly: entity activity table (who did what, how many items)
+     - Footer with collector stats
+   - Output paths:
+     - Daily: `digests/daily/YYYY-MM-DD.md`
+     - Weekly: `digests/weekly/YYYY-Wnn.md`
+     - Monthly: `digests/monthly/YYYY-MM.md`
 
-4. `digest/mailer.py`:
-   - Send HTML email via SMTP or SendGrid
-   - Support multiple recipients (from config)
-   - Attach markdown version as .md file
-   - Log to `digest_log` table
+4. CLI commands:
+   ```
+   caleidoscope digest                    # daily (default), save + print
+   caleidoscope digest --weekly           # last 7 days
+   caleidoscope digest --monthly          # last calendar month
+   caleidoscope digest --preview          # print only, don't save
+   caleidoscope digest --save             # save only, don't print
+   ```
 
-5. CLI command: `caleidoscope digest --send` (generate + email) and `caleidoscope digest --preview` (print to terminal)
+5. Tests: mock LLM responses; verify template rendering for all three cadences; verify no-API-key fallback.
 
-6. Tests: mock LLM responses, verify template rendering, verify email assembly.
-
-**Deliverable**: `caleidoscope digest --preview` prints a formatted morning briefing to the terminal. `--send` emails it.
+**Deliverable**: `caleidoscope digest` produces daily briefings; `--weekly` and `--monthly` produce longer-range summaries.
 
 ---
 
-## Step 9: Orchestration & Scheduling
+## Step 8: Orchestration & Scheduling
 
-**What**: Wire everything together so it runs automatically.
+**What**: Wire everything together for automated daily runs.
 
 **Actions**:
 1. `cli.py` — add `run-all` command:
    ```
-   caleidoscope run-all          # collect from all sources, then generate digest
-   caleidoscope collect --all    # just collection
-   caleidoscope digest --send    # just digest
+   caleidoscope run-all    # collect all sources, then generate digest
+   caleidoscope collect --all
+   caleidoscope digest
    ```
 
-2. Add a `crontab` entry (or document it):
+2. Document crontab setup:
    ```cron
-   # Run all collectors at 05:00 UTC (06:00 BST)
-   0 5 * * 1-5  cd /opt/caleidoscope && python -m caleidoscope collect --all >> /var/log/caleidoscope/collect.log 2>&1
+   # Run all collectors at 05:00 UTC (06:00 BST) on weekdays
+   0 5 * * 1-5  cd /path/to/caleidoscope && python -m caleidoscope collect --all >> logs/collect.log 2>&1
 
-   # Generate and send digest at 06:30 UTC (07:30 BST)
-   30 6 * * 1-5  cd /opt/caleidoscope && python -m caleidoscope digest --send >> /var/log/caleidoscope/digest.log 2>&1
+   # Generate daily digest at 06:00 UTC (07:00 BST) on weekdays
+   0 6 * * 1-5  cd /path/to/caleidoscope && python -m caleidoscope digest >> logs/digest.log 2>&1
+
+   # Generate weekly digest on Monday at 06:30 UTC
+   30 6 * * 1  cd /path/to/caleidoscope && python -m caleidoscope digest --weekly >> logs/digest.log 2>&1
+
+   # Generate monthly digest on 1st of each month at 07:00 UTC
+   0 7 1 * *  cd /path/to/caleidoscope && python -m caleidoscope digest --monthly >> logs/digest.log 2>&1
    ```
 
-3. Add health check: if >50% of collectors fail, send an alert email to admin.
+3. Add `--verbose` / `--quiet` flags for logging control.
 
-4. Dockerfile: final production image with cron inside, or use host cron + container exec.
+4. Collection summary: print stats at end (X items collected, Y new, Z duplicates, N errors).
 
-**Deliverable**: End-to-end automated: collectors run at 05:00, digest arrives in inbox by 07:00 London time on weekdays.
+**Deliverable**: End-to-end automated: collectors run overnight, digest ready by morning.
 
 ---
 
-## Step 10: Documentation & Deployment
+## Step 9: Polish & Testing
 
-**What**: Make it deployable and maintainable.
+**What**: Harden, test, and document.
 
 **Actions**:
-1. Write setup instructions in README (not a separate doc):
-   - How to configure `.env` and `config.yaml`
-   - How to add LSEG credentials
-   - How to set FT authentication
-   - How to add/modify collectors
-   - How to add new sources to the watchlist
+1. Integration test: run all collectors against real sites (as a manual test, not in CI).
+2. Verify FTS5 search quality with realistic queries.
+3. Verify digest output reads well with real data.
+4. Add `caleidoscope status` command: show DB stats, last collection time, item counts by source.
+5. Write setup instructions in README:
+   - Install: `pip install -e .`
+   - Initialise: `caleidoscope init-db`
+   - First run: `caleidoscope collect --all && caleidoscope digest`
+   - Schedule: crontab instructions
+   - Optional: set `ANTHROPIC_API_KEY` for AI summaries
+   - Adding new sources
 
-2. Docker deployment:
-   - `docker-compose up -d` starts Postgres + app
-   - `docker-compose exec app caleidoscope collect --all` for manual run
-   - Verify cron schedule works inside container
-
-3. Test end-to-end on a clean machine.
-
-**Deliverable**: Another person can clone, configure, and deploy in under an hour.
+**Deliverable**: Solid, documented MVP that runs with zero credentials.
 
 ---
 
-## Decisions to Make Before Starting
-
-These decisions should be made before implementation begins:
-
-| # | Decision | Options | Recommendation |
-|---|----------|---------|----------------|
-| 1 | **Where to host?** | Local server / AWS EC2 / Azure VM / Raspberry Pi | Small cloud VM (AWS t3.small ~£15/mo) — always on, no VPN needed |
-| 2 | **Email service** | Personal SMTP / Gmail SMTP / SendGrid free tier / AWS SES | SendGrid free tier (100 emails/day) — easiest setup, reliable |
-| 3 | **LLM for summaries** | Claude (Anthropic API) / GPT-4o / Local model | Claude — best summarisation quality, ~£2-3/day at this volume |
-| 4 | **FT access method** | FT API / authenticated scraping / headline-only via RSS | Start with RSS (headlines + links); add authenticated access if full text needed |
-| 5 | **LSEG auth method** | Desktop session / Platform session | Platform session (server-friendly, no GUI needed) |
-| 6 | **Search backend** | PostgreSQL FTS / Elasticsearch / SQLite FTS5 | PostgreSQL FTS — already have Postgres, good enough for this scale |
-| 7 | **Web UI in MVP?** | Yes / No | No — add in Phase 2; email + CLI is sufficient for one user |
-
----
-
-## Estimated Complexity by Step
-
-| Step | Description | Complexity | Dependencies |
-|------|-------------|------------|--------------|
-| 0 | Project scaffolding | Low | None |
-| 1 | Database models & migrations | Low | Step 0 |
-| 2 | Base collector framework | Medium | Step 1 |
-| 3 | Competitor collectors (MSCI, S&P, STOXX) | Medium-High | Step 2 |
-| 4 | BlackRock collector | Medium | Step 2 |
-| 5 | FT / news collectors | Medium | Step 2 |
-| 6 | LSEG flows integration | Medium-High | Step 2 |
-| 7 | Search engine + CLI | Medium | Step 1 |
-| 8 | Digest generator + LLM + email | High | Steps 2-6, 7 |
-| 9 | Orchestration & scheduling | Low | Step 8 |
-| 10 | Documentation & deployment | Low | Step 9 |
-
-Steps 3, 4, 5, and 6 can be developed in parallel once Step 2 is complete. Step 7 can also be developed in parallel with the collectors.
-
----
-
-## What the Morning Email Will Look Like
+## Step Dependency Graph
 
 ```
-Subject: Caleidoscope Daily Brief — Tuesday 12 February 2026
+Step 0 (scaffolding)
+  |
+  v
+Step 1 (SQLite + FTS5)
+  |
+  v
+Step 2 (base collector framework)
+  |
+  +---> Step 3 (MSCI, S&P DJI, STOXX)
+  |
+  +---> Step 4 (BlackRock, Google News, ETF Stream)
+  |
+  +---> Step 5 (SEC EDGAR)
+  |
+  +---> Step 6 (search engine) -- can be built in parallel with 3-5
+  |
+  v  (after 3, 4, 5 done)
+Step 7 (digest generator)
+  |
+  v
+Step 8 (orchestration)
+  |
+  v
+Step 9 (polish & docs)
+```
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Steps 3, 4, 5, and 6 can all be developed in parallel once Step 2 is complete.
 
-EXECUTIVE SUMMARY
+---
 
-Quiet day for index launches. MSCI published a consultation on
-changes to the MSCI ACWI IMI methodology. BlackRock cut fees on
-three iShares core ETFs. Significant inflows into ESG-labelled
-products continue, with Vanguard ESG Global gathering $320M.
+## What the Digests Will Look Like
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+### Daily digest (with AI summaries):
 
-📋 INDEX LAUNCHES & METHODOLOGY CHANGES (2 items)
+```markdown
+# Caleidoscope Daily Brief — Wednesday 12 February 2026
 
-MSCI is consulting on ACWI IMI rebalancing frequency, potentially
-moving from quarterly to monthly. S&P DJI announced a new S&P
-500 ESG Ultra index targeting the top ESG quintile.
+> 18 new items collected | 0 collector errors
 
-  • MSCI Consultation: ACWI IMI Rebalancing Frequency Review
-    msci.com/... | MSCI | 11 Feb 2026
+## Executive Summary
 
-  • S&P DJI Launches S&P 500 ESG Ultra Index
-    spglobal.com/... | S&P DJI | 11 Feb 2026
+MSCI published a consultation on ACWI IMI rebalancing frequency. S&P DJI
+announced a new ESG Ultra index. BlackRock cut fees on three core iShares
+ETFs. Markets broadly flat; ECB minutes hinted at June rate decision.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+---
 
-📊 ETF PRODUCT ACTIONS (3 items)
+## Market Commentary (4 items)
 
-BlackRock reduced expense ratios on IWDA, EIMI, and SWDA by
-1-2bps, continuing the fee compression trend in core equity ETFs.
+US equities closed flat ahead of CPI data. European markets edged higher
+on ECB minutes suggesting a June rate pause. Oil steady at $78. The dollar
+index weakened slightly against the euro.
 
-  • iShares Cuts Fees on Three Core World ETFs
-    blackrock.com/... | BlackRock | 11 Feb 2026
+- **US Stocks Tread Water Ahead of Inflation Data**
+  Reuters | 11 Feb 2026 | [link](https://reuters.com/...)
 
-  • Amundi Launches Euro Government Green Bond ETF
-    amundi.com/... | Amundi | 11 Feb 2026
+- **ECB Minutes Signal Patience on Rate Cuts**
+  Yahoo Finance | 11 Feb 2026 | [link](https://finance.yahoo.com/...)
 
-  • Franklin Templeton Files for Active Crypto ETF
-    sec.gov/... | Franklin Templeton | 10 Feb 2026
+- **European Markets Edge Higher on ECB Optimism**
+  Reuters | 11 Feb 2026 | [link](https://reuters.com/...)
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- **Dollar Weakens as Traders Await CPI Release**
+  Morningstar | 11 Feb 2026 | [link](https://morningstar.com/...)
 
-💰 AUM & FLOW HIGHLIGHTS
+---
 
-Top gatherers (1d): Vanguard ESG Global (+$320M), iShares MSCI
-World (+$285M), Invesco QQQ (+$210M). Largest outflow: iShares
-Emerging Markets (-$180M).
+## Index Launches & Methodology Changes (2 items)
 
-  [Table of top 10 inflows / top 10 outflows]
+MSCI is consulting on ACWI IMI rebalancing frequency, potentially moving
+from quarterly to monthly. S&P DJI announced a new S&P 500 ESG Ultra
+index targeting the top ESG quintile.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- **MSCI Consultation: ACWI IMI Rebalancing Frequency Review**
+  MSCI | 11 Feb 2026 | [link](https://msci.com/...)
 
-📄 RESEARCH & PUBLICATIONS (1 item)
+- **S&P DJI Launches S&P 500 ESG Ultra Index**
+  S&P DJI | 11 Feb 2026 | [link](https://spglobal.com/...)
 
-  • MSCI: "Factor Investing in a Higher-Rate Environment"
-    msci.com/... | MSCI Research | 11 Feb 2026
+---
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## ETF Product Actions (3 items)
 
-📰 NEWS & REGULATORY (4 items)
+BlackRock reduced expense ratios on IWDA, EIMI, and SWDA by 1-2bps,
+continuing fee compression in core equity ETFs.
 
-FT reports European regulators considering stricter ESG index
-labelling requirements, potentially affecting Article 8/9 fund
-benchmarks.
+- **iShares Cuts Fees on Three Core World ETFs**
+  BlackRock | 11 Feb 2026 | [link](https://blackrock.com/...)
 
-  • FT: EU Regulators Eye Tighter ESG Index Rules
-    ft.com/... | Financial Times | 11 Feb 2026
+- **Amundi Launches Euro Government Green Bond ETF**
+  Amundi | 11 Feb 2026 | [link](https://amundi.com/...)
 
-  • ETF Stream: European ETF Market Hits €2T Milestone
-    etfstream.com/... | ETF Stream | 11 Feb 2026
+---
 
-  [...]
+## Research & Publications (1 item)
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Caleidoscope v0.1 | 12 items collected | 0 collector errors
-Search archive: caleidoscope search "<query>"
+- **Factor Investing in a Higher-Rate Environment**
+  MSCI Research | 11 Feb 2026 | [link](https://msci.com/...)
+
+---
+
+## News & Regulatory (4 items)
+
+European regulators are considering stricter ESG index labelling
+requirements, potentially affecting Article 8/9 fund benchmarks.
+
+- **EU Regulators Eye Tighter ESG Index Rules**
+  Google News (FT) | 11 Feb 2026 | [link](https://ft.com/...)
+
+- **European ETF Market Hits EUR 2T Milestone**
+  ETF Stream | 11 Feb 2026 | [link](https://etfstream.com/...)
+
+---
+*Generated by Caleidoscope v0.1*
+```
+
+### Daily digest (without AI — no API key, still useful):
+
+```markdown
+# Caleidoscope Daily Brief — Wednesday 12 February 2026
+
+> 18 new items collected | 0 collector errors
+
+---
+
+## Market Commentary (4 items)
+
+- **US Stocks Tread Water Ahead of Inflation Data**
+  Reuters | 11 Feb 2026 | [link](https://reuters.com/...)
+
+- **ECB Minutes Signal Patience on Rate Cuts**
+  Yahoo Finance | 11 Feb 2026 | [link](https://finance.yahoo.com/...)
+
+[...]
+
+---
+
+## Index Launches & Methodology Changes (2 items)
+
+- **MSCI Consultation: ACWI IMI Rebalancing Frequency Review**
+  MSCI | 11 Feb 2026 | [link](https://msci.com/...)
+
+[...]
+
+---
+*Generated by Caleidoscope v0.1*
+```
+
+### Weekly digest (Monday morning):
+
+```markdown
+# Caleidoscope Weekly Brief — Week 7 (10–14 Feb 2026)
+
+> 73 items this week | Sources: 8 active | 2 collector warnings
+
+## Week in Review
+
+Active week for index methodology. MSCI opened two consultations (ACWI IMI
+rebalancing, EM index treatment of India). S&P DJI launched 3 new ESG
+indices. BlackRock cut fees on core ETFs for the second time in 6 months.
+SEC received 4 new N-1A filings for thematic ETFs.
+
+Markets: S&P 500 +1.2%, STOXX 600 +0.8%. ECB signalled patience on cuts.
+
+---
+
+## Market Commentary Highlights (22 items)
+
+Key themes: ECB rate path uncertainty, US CPI surprise to the downside,
+continued rotation into value. Oil volatile on Middle East tensions.
+
+- **US CPI Comes in Below Expectations at 2.1%** — Reuters | 12 Feb
+- **ECB Minutes Signal Patience on Rate Cuts** — Yahoo Finance | 11 Feb
+- **Value Stocks Outperform Growth for Third Straight Week** — Morningstar | 14 Feb
+[...]
+
+---
+
+## Index Launches & Methodology Changes (5 items)
+[...]
+
+## Entity Activity This Week
+
+| Entity | Index launches | ETF actions | Research | Total |
+|--------|---------------|-------------|----------|-------|
+| MSCI | 2 | 0 | 1 | 3 |
+| S&P DJI | 3 | 0 | 0 | 3 |
+| BlackRock | 0 | 3 | 1 | 4 |
+| STOXX | 1 | 0 | 0 | 1 |
+
+---
+*Generated by Caleidoscope v0.1*
+```
+
+### Monthly digest (1st business day):
+
+```markdown
+# Caleidoscope Monthly Brief — February 2026
+
+> 287 items this month | Sources: 8 active
+
+## Month in Review
+
+February saw heightened activity in ESG index methodology across all major
+providers. MSCI opened 4 consultations. S&P DJI launched 7 new indices (3 ESG,
+2 thematic, 2 fixed income). BlackRock and Amundi both made fee cuts. SEC
+filings suggest a pipeline of 12 new thematic ETFs.
+
+## Trends & Patterns
+
+- ESG index launches up 40% vs January (9 vs 6)
+- Fee compression continues: 3 providers cut fees on 8 ETFs
+- Thematic ETF filings accelerating (12 new N-1A, up from 7 in Jan)
+- MSCI most active on methodology changes (4 consultations)
+
+## Entity Activity — February 2026
+
+| Entity | Index | Methodology | ETF actions | Research | News | Total |
+|--------|-------|-------------|-------------|----------|------|-------|
+| MSCI | 3 | 4 | 0 | 2 | 12 | 21 |
+| S&P DJI | 7 | 1 | 0 | 3 | 8 | 19 |
+| STOXX | 2 | 1 | 0 | 0 | 3 | 6 |
+| BlackRock | 0 | 0 | 5 | 2 | 15 | 22 |
+
+[... full item listings by category ...]
+
+---
+*Generated by Caleidoscope v0.1*
 ```
 
 ---
 
-## Next Steps
+## Decisions Already Made
 
-To start implementation, the following is needed from you:
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Database | SQLite + FTS5 | Zero config, single file, no server, built-in full-text search |
+| Phase 1 credentials | None required | All sources are free/public; LSEG, FT, email move to Phase 2 |
+| Digest delivery | Markdown file + terminal | No SMTP needed; email added in Phase 2 |
+| LLM | Optional (Claude API) | Works without it; AI summaries are a bonus, not a requirement |
+| Hosting | Any machine with Python + cron | Laptop, server, VM — no Docker required for Phase 1 |
+| Web UI | Phase 2 | CLI + markdown is sufficient for a single user in Phase 1 |
 
-1. **LSEG Data Library credentials** (app key, username, password) — store in `.env`
-2. **FT subscription details** — how you currently log in (for cookie-based auth)
-3. **Email preferences** — which email address to send to; whether you have SMTP access or prefer SendGrid
-4. **Hosting preference** — cloud VM, local machine, or existing server
-5. **ETF watchlist** — initial list of ETF tickers/RICs you want to track for flows
-6. **Any additional sources** — beyond what's listed in the PRD
+## Open Decisions
+
+| # | Decision | Options | Notes |
+|---|----------|---------|-------|
+| 1 | **Which sites actually have usable RSS?** | Need to probe each site | First task in Step 3; determines scrape vs RSS per source |
+| 2 | **Playwright needed?** | Only if key sites are JS-rendered SPAs | Test with httpx first; add Playwright per-collector if needed |
+| 3 | **Google News RSS still working?** | Test it | Google has deprecated/changed this before; need a fallback plan |
+
+---
+
+## Phase 2 Preview (not in scope for MVP)
+
+When you're ready to add credentials, the following modules slot in:
+
+| Feature | What's needed | Files to add/modify |
+|---------|--------------|-------------------|
+| LSEG ETF flows | `LSEG_APP_KEY`, `LSEG_USERNAME`, `LSEG_PASSWORD` | `collectors/lseg_flows.py`, config entry |
+| FT articles | `FT_SESSION_COOKIE` or FT API key | `collectors/ft.py`, config entry |
+| Email digest | `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, `DIGEST_RECIPIENTS` | `digest/mailer.py`, CLI `--send` flag |
+| Remaining clients | Nothing (free scrape) | `collectors/vanguard.py`, `invesco.py`, `amundi.py`, `franklin.py` |
